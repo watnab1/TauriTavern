@@ -4,7 +4,6 @@ import android.content.res.Configuration
 import android.content.res.Resources
 import android.graphics.Color
 import android.os.Build
-import android.os.Handler
 import android.view.View
 import android.view.Window
 import android.view.WindowManager
@@ -21,8 +20,8 @@ class AndroidInsetsBridge(
   private val contentRootProvider: () -> View?,
   private val webViewProvider: () -> WebView?,
   private val isDestroyed: () -> Boolean,
-  private val mainHandler: Handler,
-  private val readinessPoller: WebViewReadinessPoller,
+  readinessPoller: ReadinessPoller<WebView>,
+  private val pageSession: WebViewPageSession,
 ) {
   private var immersiveFullscreenEnabled: Boolean = true
   private var systemBarInsets: Insets = Insets.NONE
@@ -31,11 +30,19 @@ class AndroidInsetsBridge(
   private var isInsetsPushScheduled: Boolean = false
   private var hasPendingForcedInsetsPush: Boolean = false
   private var hasReadyPageInsetsInjection: Boolean = false
-  private var isInsetsSyncScheduled: Boolean = false
-  private var hasPendingInsetsSync: Boolean = false
   private var isInsetsListenerAttached: Boolean = false
   private val webViewInsetsStyleApplier: WebViewInsetsStyleApplier by lazy {
     WebViewInsetsStyleApplier(resources)
+  }
+  private val readinessCoordinator: WebViewReadinessCoordinator<WebView> by lazy {
+    WebViewReadinessCoordinator(
+      pageSession = pageSession,
+      targetProvider = webViewProvider,
+      isDestroyed = isDestroyed,
+      poller = readinessPoller,
+      readinessScript = PAGE_READY_SCRIPT,
+      onReady = { pushInsetsToWebView(force = true) },
+    )
   }
 
   fun onCreate() {
@@ -51,17 +58,31 @@ class AndroidInsetsBridge(
 
   fun onWebViewAvailable() {
     resetWebViewInjectionState()
-    refreshInjection()
+    configureImmersiveSystemBars()
+    requestSystemInsets()
+    readinessCoordinator.syncWhenPageReady()
   }
 
   fun onMainFrameNavigationStarted() {
     resetWebViewInjectionState()
-    refreshInjection()
+    configureImmersiveSystemBars()
+    requestSystemInsets()
+    readinessCoordinator.onMainFrameNavigationStarted()
+  }
+
+  fun onMainFramePageFinished() {
+    configureImmersiveSystemBars()
+    requestSystemInsets()
+    readinessCoordinator.onMainFramePageFinished()
   }
 
   fun onResume() {
     configureImmersiveSystemBars()
     refreshInjection()
+  }
+
+  fun onDestroy() {
+    readinessCoordinator.onDestroy()
   }
 
   fun setImmersiveFullscreenEnabled(enabled: Boolean) {
@@ -75,7 +96,7 @@ class AndroidInsetsBridge(
   fun refreshInjection() {
     attachSystemInsetsListenerIfNeeded()
     requestSystemInsets()
-    scheduleInsetsSyncWhenPageReady()
+    readinessCoordinator.syncWhenPageReady()
   }
 
   private fun resetWebViewInjectionState() {
@@ -186,7 +207,13 @@ class AndroidInsetsBridge(
     }
 
     val targetWebView = webViewProvider() ?: return
+    val navigationGeneration = pageSession.generation
     hasPendingForcedInsetsPush = hasPendingForcedInsetsPush || force
+    if (!hasReadyPageInsetsInjection && !force) {
+      // Nothing can be applied until the own page reports #sheld ready.
+      // Do not post view work for about:blank or external pages.
+      return
+    }
     if (isInsetsPushScheduled) {
       return
     }
@@ -194,7 +221,21 @@ class AndroidInsetsBridge(
 
     targetWebView.post {
       isInsetsPushScheduled = false
+
+      // The previous page's pending view post must never mutate the new page.
+      if (
+        isDestroyed() ||
+        !pageSession.isCurrent(navigationGeneration) ||
+        !pageSession.ownsCurrentPage()
+      ) {
+        return@post
+      }
+
       val activeWebView = webViewProvider() ?: return@post
+      if (activeWebView !== targetWebView) {
+        return@post
+      }
+
       val snapshot = InsetsSnapshot(systemBarInsets, imeBottomInset)
       val shouldForcePush = hasPendingForcedInsetsPush
       hasPendingForcedInsetsPush = false
@@ -213,35 +254,6 @@ class AndroidInsetsBridge(
         hasReadyPageInsetsInjection = true
       }
     }
-  }
-
-  private fun scheduleInsetsSyncWhenPageReady() {
-    if (webViewProvider() == null) {
-      return
-    }
-    if (isInsetsSyncScheduled) {
-      hasPendingInsetsSync = true
-      return
-    }
-
-    isInsetsSyncScheduled = true
-    hasPendingInsetsSync = false
-    readinessPoller.pollUntilReady(
-      readinessScript = PAGE_READY_SCRIPT,
-      onReady = { pushInsetsToWebView(force = true) },
-      onFinished = {
-        isInsetsSyncScheduled = false
-        if (hasPendingInsetsSync) {
-          hasPendingInsetsSync = false
-          scheduleInsetsSyncWhenPageReady()
-        } else if (!hasReadyPageInsetsInjection) {
-          mainHandler.postDelayed(
-            { if (!isDestroyed()) scheduleInsetsSyncWhenPageReady() },
-            WebViewReadinessPoller.DEFAULT_RETRY_DELAY_MS,
-          )
-        }
-      },
-    )
   }
 
   companion object {

@@ -47,14 +47,21 @@ open class RustPlugin : Plugin<Project> {
         }
 
         afterEvaluate {
-            for (profile in listOf("debug", "release")) {
+            // `e2e` is a Gradle build type that must compile the Rust library
+            // with the Release Cargo profile while remaining a separate AGP
+            // variant (debuggable, E2E-signed, isolated application id).
+            for ((profile, cargoProfile) in listOf(
+                "debug" to "debug",
+                "release" to "release",
+                "e2e" to "release",
+            )) {
                 val profileCapitalized = profile.replaceFirstChar { it.uppercase() }
                 val buildTask = tasks.maybeCreate(
                     "rustBuildUniversal$profileCapitalized",
                     DefaultTask::class.java
                 ).apply {
                     group = TASK_GROUP
-                    description = "Build dynamic library in $profile mode for all targets"
+                    description = "Build dynamic library in $cargoProfile mode for all targets"
                 }
 
                 tasks["mergeUniversal${profileCapitalized}JniLibFolders"].dependsOn(buildTask)
@@ -63,15 +70,33 @@ open class RustPlugin : Plugin<Project> {
                     val targetName = targetPair.value
                     val targetArch = archList[targetPair.index]
                     val targetArchCapitalized = targetArch.replaceFirstChar { it.uppercase() }
+
+                    if (profile == "e2e") {
+                        val targetBuildTask = project.tasks.maybeCreate(
+                            "rustBuild$targetArchCapitalized$profileCapitalized",
+                            E2eBuildTask::class.java
+                        ).apply {
+                            group = TASK_GROUP
+                            description = "Build dynamic library in $cargoProfile mode for $targetArch"
+                            rootDirRel = config.rootDirRel
+                            target = targetName
+                        }
+                        buildTask.dependsOn(targetBuildTask)
+                        tasks["merge$targetArchCapitalized${profileCapitalized}JniLibFolders"].dependsOn(
+                            targetBuildTask
+                        )
+                        continue
+                    }
+
                     val targetBuildTask = project.tasks.maybeCreate(
                         "rustBuild$targetArchCapitalized$profileCapitalized",
                         BuildTask::class.java
                     ).apply {
                         group = TASK_GROUP
-                        description = "Build dynamic library in $profile mode for $targetArch"
+                        description = "Build dynamic library in $cargoProfile mode for $targetArch"
                         rootDirRel = config.rootDirRel
                         target = targetName
-                        release = profile == "release"
+                        release = cargoProfile == "release"
                     }
 
                     buildTask.dependsOn(targetBuildTask)

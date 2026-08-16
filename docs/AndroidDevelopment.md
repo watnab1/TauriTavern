@@ -28,12 +28,14 @@ https://github.com/tauri-apps/tauri/issues/14240
 核心入口仍是 `src-tauri/crates/tauritavern/gen/android/app/src/main/java/com/tauritavern/client/MainActivity.kt`，但职责已拆分为：
 
 - `AndroidInsetsBridge.kt`：系统栏/IME inset 监听与 CSS 变量注入；
-- `WebViewReadinessPoller.kt`：页面就绪轮询；
+- `WebViewPageSession.kt`：主 frame URL 归属与 navigation generation；
+- `WebViewReadinessPoller.kt`：带 cancellable token 的页面就绪轮询；
+- `WebViewReadinessCoordinator.kt`：把单次 readiness poll 绑定到当前自有页面生命周期；
 - `ShareIntentParser.kt`：分享 Intent 解析与导入文件持久化；
 - `SharePayloadDispatcher.kt`：分享 payload 队列与前端 bridge 分发；
 - `MainActivity.kt`：仅保留生命周期编排与模块协作。
 
-- 保留 edge-to-edge 与透明系统栏配置（沉浸基础）；
+- 保留 edge-to-edge 与透明系统栏配置（沉浸基础），该行为对所有页面生效；
 - 监听系统栏与 IME inset；
 - 在 native 侧消费 IME 语义并把底部避让作为 CSS 变量注入；不再让 descendant WebView 将 IME 继续解释为 viewport resize；
 - Android native 注入的 CSS 变量（provider 层）：
@@ -51,16 +53,22 @@ Android 语义说明（以 contract 层为准）：
 - 沉浸模式下，它会回落为 `0`，允许应用顶部 UI 与第三方 fixed 浮层以 full-bleed 方式沉入状态栏区域。
 - `--tt-ime-bottom` 是 Android 上唯一的键盘布局信号；WebView 本身不应再把 IME 当作页面 viewport 缩放来源。
 
-注入时序约束：
+注入时序与页面归属约束：
 
-- 注入前先检查页面就绪：
+- `WebViewPageSession` 在每次主 frame `onPageStarted` 更新 URL、页面归属和 generation；
+- 只有 `http(s)://tauri.localhost`（以及桌面语义的 `tauri://localhost`）被识别为 TauriTavern 自有页面；
+- 自有页面注入前检查：
   - `location.href !== 'about:blank'`
   - `Boolean(document.getElementById('sheld'))`
-  - 未满足时进行有限次短重试。
+- 未满足时进行有界短重试；`onPageFinished` 后提供一次新的有界重试周期，之后 fail fast，不再无限 `postDelayed`；
+- 外部测试页面不等待 `#sheld`，不执行 TauriTavern 私有 CSS insets 注入，不注入 `window.__TAURITAVERN_INSETS__`；edge-to-edge 与 immersive fullscreen 仍由窗口层保持不变；
+- 每次导航取消上一页面的 poll token；旧 timer、evaluate 回调和 view post 均通过 generation/token 校验失效；
+- `onDestroy` 使 generation 失效并取消当前 poll，Activity/WebView 销毁后不遗留重试。
 
 说明：
 
 - 这里**不以 `readyState` 作为硬门槛**：SillyTavern 启动阶段可能在 `readyState=loading` 时就触发 popup/onboarding 的 focus 流；IME ownership 路由依赖早期 bridge 可用，因此以“`#sheld` 已挂载”作为最小可靠前置条件更稳。
+- 不要把任意 localhost 测试页误判为自有页面；外部 fixture 即使跑在 `127.0.0.1` 也保持外部页面语义。
 
 前端消费变量在：
 
@@ -71,6 +79,7 @@ Android 语义说明（以 contract 层为准）：
 
 - 不要把“就绪态判断”误删为一次性注入。
 - 不要把此问题误判为纯 CSS 问题；先验证变量是否被注入到正确页面上下文。
+- 不要给外部页面增加任何 readiness poll 或 CSS insets 注入。
 - 若后续 Tauri 官方修复 WebView safe-area 注入时序，可再评估收敛逻辑。
 
 ---
@@ -414,10 +423,11 @@ Android AI 生成使用任务级 `dataSync` Foreground Service。Rust `ChatCompl
 
 ### 8.3 Wry Android 生成层所有权
 
-`generated/*` 只是一份可重建的构建输出。项目实际维护的 Wry 分叉只有 generated 目录外、同 package 同类名的两个文件，Gradle 排除对应 generated 类以避免重复编译：
+`generated/*` 只是一份可重建的构建输出。项目实际维护的 Wry 分叉只有 generated 目录外、同 package 同类名的三个文件，Gradle 排除对应 generated 类以避免重复编译：
 
 - `RustWebChromeClient.kt`：fullscreen 转发与结构化 WebView 日志；
-- `RustWebViewClient.kt`：主文档导航通知、拦截失败响应，以及 Host Resource 显式缓存策略优先级。
+- `RustWebViewClient.kt`：主文档导航通知、拦截失败响应，以及 Host Resource 显式缓存策略优先级；
+- `Ipc.kt`：外部主 frame 页面 fail-closed，不得通过 Wry `window.ipc` 进入 Tauri command surface。
 
 两个文件头必须记录当前 Wry baseline。升级 Wry 时逐文件与锁文件解析到的 upstream 模板比较；缺少显式 `Cache-Control` 的自定义协议响应采用 Wry 的 `no-store` 默认值，Host Resource 已明确返回的 `private, no-cache` 或错误 `no-store` 不得被 transport 层覆盖。删除 generated 目录后，debug 与 minified release 构建都必须能够从零重建。
 

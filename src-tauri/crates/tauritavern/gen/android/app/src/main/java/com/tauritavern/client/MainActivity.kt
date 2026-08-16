@@ -21,6 +21,7 @@ import java.util.concurrent.RejectedExecutionException
 
 class MainActivity : TauriActivity(), AndroidWebFullscreenHost {
   private var webView: WebView? = null
+  private val pageSession = WebViewPageSession()
   private val mainHandler = Handler(Looper.getMainLooper())
   private val backgroundExecutor: ExecutorService =
     Executors.newSingleThreadExecutor { runnable ->
@@ -37,11 +38,14 @@ class MainActivity : TauriActivity(), AndroidWebFullscreenHost {
   private val aiGenerationNotifier: AndroidAiGenerationNotifier by lazy {
     AndroidAiGenerationNotifier(applicationContext)
   }
+  private val nativeJsBridgeGuard: TauriTavernNativeJsBridgeGuard by lazy {
+    TauriTavernNativeJsBridgeGuard(pageSession)
+  }
   private val aiGenerationJsBridge: AndroidAiGenerationJsBridge by lazy {
-    AndroidAiGenerationJsBridge(mainHandler, aiGenerationNotifier)
+    AndroidAiGenerationJsBridge(mainHandler, aiGenerationNotifier, nativeJsBridgeGuard)
   }
   private val systemUiJsBridge: AndroidSystemUiJsBridge by lazy {
-    AndroidSystemUiJsBridge(mainHandler, insetsBridge)
+    AndroidSystemUiJsBridge(mainHandler, insetsBridge, nativeJsBridgeGuard)
   }
   private val importArchivePickerLauncher =
     registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -60,6 +64,7 @@ class MainActivity : TauriActivity(), AndroidWebFullscreenHost {
       contentResolver = contentResolver,
       launchImportArchivePicker = { launchImportArchivePicker() },
       launchExportArchivePicker = { suggestedName -> launchExportArchivePicker(suggestedName) },
+      bridgeGuard = nativeJsBridgeGuard,
     )
   }
   private val publicDownloadJsBridge: AndroidPublicDownloadJsBridge by lazy {
@@ -69,11 +74,18 @@ class MainActivity : TauriActivity(), AndroidWebFullscreenHost {
       launchCreateDocumentPicker = { suggestedName, mimeType ->
         launchPublicDownloadDocumentPicker(suggestedName, mimeType)
       },
+      bridgeGuard = nativeJsBridgeGuard,
     )
   }
 
-  private val readinessPoller: WebViewReadinessPoller by lazy {
-    WebViewReadinessPoller(webViewProvider = { webView }, isDestroyed = { isActivityDestroyed })
+  private val readinessPoller: WebViewReadinessPoller<WebView> by lazy {
+    WebViewReadinessPoller(
+      targetProvider = { webView },
+      isDestroyed = { isActivityDestroyed },
+      postToTarget = { target, task -> target.post(task) },
+      postDelayedToTarget = { target, delayMs, task -> target.postDelayed(task, delayMs) },
+      evaluateOnTarget = { target, script, callback -> target.evaluateJavascript(script, callback) },
+    )
   }
 
   private val insetsBridge: AndroidInsetsBridge by lazy {
@@ -83,8 +95,8 @@ class MainActivity : TauriActivity(), AndroidWebFullscreenHost {
       contentRootProvider = { window.decorView.findViewById(android.R.id.content) },
       webViewProvider = { webView },
       isDestroyed = { isActivityDestroyed },
-      mainHandler = mainHandler,
       readinessPoller = readinessPoller,
+      pageSession = pageSession,
     )
   }
   private val webFullscreenController: AndroidWebFullscreenController by lazy {
@@ -102,8 +114,8 @@ class MainActivity : TauriActivity(), AndroidWebFullscreenHost {
     SharePayloadDispatcher(
       webViewProvider = { webView },
       isDestroyed = { isActivityDestroyed },
-      mainHandler = mainHandler,
       readinessPoller = readinessPoller,
+      pageSession = pageSession,
     )
   }
 
@@ -130,7 +142,9 @@ class MainActivity : TauriActivity(), AndroidWebFullscreenHost {
   }
 
   override fun onWebViewCreate(webView: WebView) {
+    configureWebViewDebugging()
     this.webView = webView
+    Ipc.nativeBridgeGuard = nativeJsBridgeGuard
     webView.addJavascriptInterface(aiGenerationJsBridge, AndroidAiGenerationJsBridge.INTERFACE_NAME)
     webView.addJavascriptInterface(systemUiJsBridge, AndroidSystemUiJsBridge.INTERFACE_NAME)
     webView.addJavascriptInterface(
@@ -175,10 +189,21 @@ class MainActivity : TauriActivity(), AndroidWebFullscreenHost {
 
   override fun onDestroy() {
     isActivityDestroyed = true
+    Ipc.nativeBridgeGuard = null
+    pageSession.invalidate()
+    insetsBridge.onDestroy()
+    sharePayloadDispatcher.onDestroy()
     mainHandler.removeCallbacksAndMessages(null)
     backgroundExecutor.shutdownNow()
     RustWebViewClient.mainFrameNavigationListener = null
     super.onDestroy()
+  }
+
+  private fun configureWebViewDebugging() {
+    // Explicit policy for every build variant. Wry additionally enables CDP for
+    // debug builds, but Release-like E2E has no debug_assertions and Production
+    // must never inherit WebView 113+ auto-debugging by relying on manifest state.
+    WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG || BuildConfig.E2E_ENABLED)
   }
 
   private fun installWebViewNavigationHooks() {
@@ -189,7 +214,18 @@ class MainActivity : TauriActivity(), AndroidWebFullscreenHost {
           if (view !== activeWebView) {
             return
           }
+          pageSession.onMainFrameNavigationStarted(url)
           insetsBridge.onMainFrameNavigationStarted()
+          sharePayloadDispatcher.onMainFrameNavigationStarted()
+        }
+
+        override fun onMainFramePageFinished(view: WebView, url: String) {
+          val activeWebView = webView ?: return
+          if (view !== activeWebView || pageSession.currentUrl != url) {
+            return
+          }
+          insetsBridge.onMainFramePageFinished()
+          sharePayloadDispatcher.onMainFramePageFinished()
         }
       }
   }

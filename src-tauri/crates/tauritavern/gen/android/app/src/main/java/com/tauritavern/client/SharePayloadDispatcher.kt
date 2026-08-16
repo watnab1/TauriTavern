@@ -1,17 +1,25 @@
 package com.tauritavern.client
 
-import android.os.Handler
 import android.webkit.WebView
 import org.json.JSONArray
 
 class SharePayloadDispatcher(
   private val webViewProvider: () -> WebView?,
   private val isDestroyed: () -> Boolean,
-  private val mainHandler: Handler,
-  private val readinessPoller: WebViewReadinessPoller,
+  readinessPoller: ReadinessPoller<WebView>,
+  private val pageSession: WebViewPageSession,
 ) {
   private val pendingSharePayloads = ArrayDeque<NativeSharePayload>()
-  private var isShareBridgeSyncScheduled: Boolean = false
+  private val readinessCoordinator: WebViewReadinessCoordinator<WebView> by lazy {
+    WebViewReadinessCoordinator(
+      pageSession = pageSession,
+      targetProvider = webViewProvider,
+      isDestroyed = isDestroyed,
+      poller = readinessPoller,
+      readinessScript = SHARE_BRIDGE_READY_SCRIPT,
+      onReady = { flushPendingSharePayloads() },
+    )
+  }
 
   fun enqueue(payloads: Collection<NativeSharePayload>) {
     if (payloads.isEmpty()) {
@@ -19,7 +27,7 @@ class SharePayloadDispatcher(
     }
 
     pendingSharePayloads.addAll(payloads)
-    scheduleShareBridgeSyncWhenReady()
+    requestDispatch()
   }
 
   fun requestDispatch() {
@@ -27,35 +35,28 @@ class SharePayloadDispatcher(
       return
     }
 
-    scheduleShareBridgeSyncWhenReady()
+    readinessCoordinator.syncWhenPageReady()
   }
 
-  private fun scheduleShareBridgeSyncWhenReady() {
-    if (webViewProvider() == null) {
-      return
-    }
-    if (isShareBridgeSyncScheduled) {
-      return
-    }
+  fun onMainFrameNavigationStarted() {
+    readinessCoordinator.onMainFrameNavigationStarted()
+    requestDispatch()
+  }
 
-    isShareBridgeSyncScheduled = true
-    readinessPoller.pollUntilReady(
-      readinessScript = SHARE_BRIDGE_READY_SCRIPT,
-      onReady = { flushPendingSharePayloads() },
-      onFinished = {
-        isShareBridgeSyncScheduled = false
-        if (pendingSharePayloads.isNotEmpty()) {
-          mainHandler.postDelayed(
-            { if (!isDestroyed()) scheduleShareBridgeSyncWhenReady() },
-            WebViewReadinessPoller.DEFAULT_RETRY_DELAY_MS,
-          )
-        }
-      },
-    )
+  fun onMainFramePageFinished() {
+    readinessCoordinator.onMainFramePageFinished()
+    requestDispatch()
+  }
+
+  fun onDestroy() {
+    readinessCoordinator.onDestroy()
   }
 
   private fun flushPendingSharePayloads() {
     val targetWebView = webViewProvider() ?: return
+    if (isDestroyed() || !pageSession.ownsCurrentPage()) {
+      return
+    }
     if (pendingSharePayloads.isEmpty()) {
       return
     }
@@ -81,16 +82,20 @@ class SharePayloadDispatcher(
         }
       })();
       """.trimIndent()
+    val navigationGeneration = pageSession.generation
 
     targetWebView.post {
       val activeWebView = webViewProvider()
-      if (activeWebView == null || isDestroyed()) {
+      if (
+        activeWebView == null ||
+        activeWebView !== targetWebView ||
+        isDestroyed() ||
+        !pageSession.isCurrent(navigationGeneration) ||
+        !pageSession.ownsCurrentPage()
+      ) {
         requeueAtFront(payloads)
-        if (!isDestroyed()) {
-          mainHandler.postDelayed(
-            { scheduleShareBridgeSyncWhenReady() },
-            WebViewReadinessPoller.DEFAULT_RETRY_DELAY_MS,
-          )
+        if (!isDestroyed() && pageSession.ownsCurrentPage()) {
+          requestDispatch()
         }
         return@post
       }

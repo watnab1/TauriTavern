@@ -34,6 +34,8 @@
     "flatpak:sources:check": "bash packaging/flatpak/generate-sources.sh --check",
     "android:dev": "node scripts/tauri-app.mjs --prepare-frontend android dev",
     "android:build": "node scripts/tauri-app.mjs --prepare-frontend android build",
+    "android:build:e2e": "node scripts/android-build-e2e.mjs",
+    "android:preflight": "node scripts/android-webview-preflight.mjs",
     "ios:dev": "node scripts/tauri-app.mjs --prepare-frontend ios dev",
     "ios:build": "node scripts/tauri-app.mjs --prepare-frontend ios build",
     "ios:dev:policy": "node scripts/ios-policy.mjs dev",

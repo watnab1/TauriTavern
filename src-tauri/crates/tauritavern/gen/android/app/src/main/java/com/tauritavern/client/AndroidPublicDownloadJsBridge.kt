@@ -15,15 +15,20 @@ class AndroidPublicDownloadJsBridge(
   private val contentResolver: ContentResolver,
   private val exportStagingRoot: File,
   private val launchCreateDocumentPicker: (String, String) -> Unit,
+  private val bridgeGuard: TauriTavernNativeJsBridgeGuard,
 ) {
   @JavascriptInterface
-  fun supportsDirectPublicDownloads(): Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+  fun supportsDirectPublicDownloads(): Boolean {
+    bridgeGuard.requireHostPage()
+    return Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+  }
 
   @JavascriptInterface
   fun requestCreateDocumentPicker(
     suggestedName: String?,
     mimeType: String?,
   ) {
+    bridgeGuard.requireHostPage()
     launchCreateDocumentPicker(
       normalizeDisplayName(suggestedName),
       normalizeMimeType(mimeType),
@@ -35,6 +40,7 @@ class AndroidPublicDownloadJsBridge(
     sourcePath: String?,
     contentUri: String?,
   ): String {
+    bridgeGuard.requireHostPage()
     val sourceFile = resolveSourceFile(sourcePath)
     val targetUri = Uri.parse(requireNotNull(contentUri).trim())
 
@@ -52,6 +58,7 @@ class AndroidPublicDownloadJsBridge(
     displayName: String?,
     mimeType: String?,
   ): String {
+    bridgeGuard.requireHostPage()
     require(supportsDirectPublicDownloads()) {
       "Direct public Downloads export requires Android 10 or newer"
     }

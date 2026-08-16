@@ -9,14 +9,17 @@ class AndroidImportArchiveJsBridge(
   private val contentResolver: ContentResolver,
   private val launchImportArchivePicker: () -> Unit,
   private val launchExportArchivePicker: (String) -> Unit,
+  private val bridgeGuard: TauriTavernNativeJsBridgeGuard,
 ) {
   @JavascriptInterface
   fun requestImportArchivePicker() {
+    bridgeGuard.requireHostPage()
     launchImportArchivePicker()
   }
 
   @JavascriptInterface
   fun requestExportArchivePicker(suggestedName: String?) {
+    bridgeGuard.requireHostPage()
     val normalizedName =
       suggestedName?.trim().orEmpty().ifBlank { DEFAULT_EXPORT_FILE_NAME }
     launchExportArchivePicker(normalizedName)
@@ -27,6 +30,7 @@ class AndroidImportArchiveJsBridge(
     contentUri: String?,
     targetPath: String?,
   ): String {
+    bridgeGuard.requireHostPage()
     val uri = Uri.parse(requireNotNull(contentUri).trim())
     val targetFile = File(requireNotNull(targetPath).trim())
 
@@ -38,6 +42,7 @@ class AndroidImportArchiveJsBridge(
     sourcePath: String?,
     contentUri: String?,
   ): String {
+    bridgeGuard.requireHostPage()
     val sourceFile = File(requireNotNull(sourcePath).trim())
     val targetUri = Uri.parse(requireNotNull(contentUri).trim())
 

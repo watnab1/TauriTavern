@@ -2,21 +2,50 @@ name: Android Debug APK
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - dev
+    paths:
+      - ".github/workflows/android-debug-build.yml"
+      - "src-tauri/**"
+      - "src/**"
+      - "scripts/**"
+      - "default/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "rspack.config.js"
+      - "tsconfig.host.json"
+      - "tsconfig.ui.json"
+  pull_request:
+    paths:
+      - ".github/workflows/android-debug-build.yml"
+      - "src-tauri/**"
+      - "src/**"
+      - "scripts/**"
+      - "default/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "rspack.config.js"
+      - "tsconfig.host.json"
+      - "tsconfig.ui.json"
 
 permissions:
   contents: write
 
 concurrency:
-  group: android-debug-apk-${{ github.ref }}
-  cancel-in-progress: false
+  group: >-
+    android-debug-apk-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  TAURITAVERN_BUILD_BRANCH: dev
+  TAURITAVERN_BUILD_REVISION: ${{ github.sha }}
 
 jobs:
   android-debug-apk:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
 
@@ -75,59 +104,159 @@ jobs:
           pnpm android:build --debug --verbose --apk --split-per-abi
           --target aarch64
 
-      - name: Collect Android Debug APK and checksums
+      - name: Run Android Kotlin behavior tests
+        shell: bash
+        working-directory: src-tauri/crates/tauritavern/gen/android
+        env:
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          TAURITAVERN_SKIP_WEB_BUILD: "1"
+        run: ./gradlew :app:testArm64DebugUnitTest
+
+      - name: Build Release-like E2E APK (aarch64)
+        shell: bash
+        env:
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: node scripts/android-build-e2e.mjs --skip-debug-build
+
+      - name: Process Production Release manifest contract
+        shell: bash
+        working-directory: src-tauri/crates/tauritavern/gen/android
+        env:
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          TAURITAVERN_SKIP_WEB_BUILD: "1"
+        run: ./gradlew :app:processArm64ReleaseMainManifest
+
+      - name: Collect APKs
         id: collect
         shell: bash
         run: |
           set -euo pipefail
           apk_root="src-tauri/crates/tauritavern/gen/android/app/build/outputs/apk"
+          debug_apk="${apk_root}/arm64/debug/app-arm64-debug.apk"
+          e2e_apk="${apk_root}/arm64/e2e/app-arm64-e2e.apk"
+          release_manifest="src-tauri/crates/tauritavern/gen/android/app/build/intermediates/merged_manifest/arm64Release/processArm64ReleaseMainManifest/AndroidManifest.xml"
+
+          test -f "${debug_apk}"
+          test -f "${e2e_apk}"
+          test -f "${release_manifest}"
+
           mkdir -p dist
-          mapfile -t apks < <(find "${apk_root}" -type f -name '*debug*.apk' | sort)
-          if [[ "${#apks[@]}" -ne 1 ]]; then
-            echo "Expected exactly one aarch64 debug APK, found ${#apks[@]} under ${apk_root}" >&2
-            exit 1
-          fi
-          apk="${apks[0]}"
-          if [[ "$(basename "${apk}")" != "app-arm64-debug.apk" ]]; then
-            echo "Expected app-arm64-debug.apk, found ${apk}" >&2
-            exit 1
-          fi
-          echo "APK: ${apk}"
-          cp "${apk}" dist/
-          (cd dist && sha256sum -- ./*.apk > SHA256SUMS)
+          cp "${debug_apk}" dist/app-arm64-debug.apk
+          cp "${e2e_apk}" dist/app-arm64-e2e.apk
+          cp "${release_manifest}" dist/AndroidManifest-release.xml
+
+          {
+            echo "debug_apk=dist/app-arm64-debug.apk"
+            echo "e2e_apk=dist/app-arm64-e2e.apk"
+            echo "release_manifest=dist/AndroidManifest-release.xml"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify Debug APK contract
+        shell: bash
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: >-
+          node scripts/ci/verify-android-build.mjs
+          --apk dist/app-arm64-debug.apk
+          --build-type debug
+          --git-sha "${GITHUB_SHA}"
+          --workflow-run-id "${GITHUB_RUN_ID}"
+          --metadata-out dist/build-metadata.json
+
+      - name: Verify E2E APK contract
+        shell: bash
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: >-
+          node scripts/ci/verify-android-build.mjs
+          --apk dist/app-arm64-e2e.apk
+          --build-type e2e
+          --git-sha "${GITHUB_SHA}"
+          --workflow-run-id "${GITHUB_RUN_ID}"
+          --metadata-out dist/build-metadata-e2e.json
+
+      - name: Verify Production Release manifest contract
+        shell: bash
+        run: >-
+          node scripts/ci/verify-android-build.mjs
+          --release-manifest dist/AndroidManifest-release.xml
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum app-arm64-debug.apk app-arm64-e2e.apk build-metadata.json build-metadata-e2e.json > SHA256SUMS)
           cat dist/SHA256SUMS
 
-      - name: Upload Android Debug APK artifact
+      - name: Runtime smoke on attached Android device
+        shell: bash
+        run: |
+          : "${ANDROID_HOME:?Android SDK is not configured for this step}"
+          adb_path="${ANDROID_HOME}/platform-tools/adb"
+          devices="$("${adb_path}" devices | awk 'NR > 1 && $2 == "device" { print $1 }')"
+          if [[ -z "${devices}" ]]; then
+            echo "NO_DEVICE_BOUNDARY: ubuntu-latest has no arm64 Android device or emulator; runtime smoke is not executed here. The uploaded APK contract checks are static only."
+            echo "NO_DEVICE_BOUNDARY: run 'pnpm android:preflight --apk dist/app-arm64-debug.apk --package com.tauritavern.client.debug --smoke --json' on an arm64 host."
+            echo "NO_DEVICE_BOUNDARY: run 'pnpm android:preflight --apk dist/app-arm64-e2e.apk --package com.tauritavern.client.e2e --smoke --json' on an arm64 host."
+            exit 0
+          fi
+          if [[ "$(wc -l <<< "${devices}")" -ne 1 ]]; then
+            echo "Expected exactly one attached Android device for smoke, found: ${devices}" >&2
+            exit 1
+          fi
+          node scripts/android-webview-preflight.mjs --apk dist/app-arm64-debug.apk --package com.tauritavern.client.debug --build-metadata dist/build-metadata.json --smoke --json
+          node scripts/android-webview-preflight.mjs --apk dist/app-arm64-e2e.apk --package com.tauritavern.client.e2e --build-metadata dist/build-metadata-e2e.json --smoke --json
+
+      - name: Upload Debug APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tauritavern-android-debug-apks
-          path: dist/*
+          name: tauritavern-android-debug-apk
+          path: |
+            dist/app-arm64-debug.apk
+            dist/build-metadata.json
+            dist/SHA256SUMS
           if-no-files-found: error
           retention-days: 7
 
-      - name: Publish aarch64 Debug APK GitHub Release
+      - name: Upload E2E APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauritavern-android-e2e-apk
+          path: |
+            dist/app-arm64-e2e.apk
+            dist/build-metadata-e2e.json
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish aarch64 Debug/E2E APK GitHub Release
+        if: github.event_name == 'workflow_dispatch'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           tag="android-debug-aarch64-${GITHUB_SHA:0:7}"
-          title="TauriTavern Android Debug APK (aarch64) ${GITHUB_SHA:0:7}"
+          title="TauriTavern Android Debug/E2E APKs (aarch64) ${GITHUB_SHA:0:7}"
           notes=$(cat <<EOF
-          Automated aarch64 Debug APK build.
+          Automated aarch64 Android test APKs.
 
           - Commit: \`${GITHUB_SHA}\`
-          - Package: \`com.tauritavern.client.debug\`
+          - Packages: \`com.tauritavern.client.debug\`, \`com.tauritavern.client.e2e\`
           - ABI: \`arm64-v8a\`
-          - Signing: standard Android Debug key
+          - Signing: Android Debug key (debug), dedicated non-production E2E key (e2e)
+          - WebView CDP: explicitly enabled for both variants
+          - Artifact traceability: \`build-metadata*.json\` + \`SHA256SUMS\`
           EOF
           )
           if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             echo "Release ${tag} already exists; refreshing aarch64 assets"
-            gh release upload "${tag}" dist/app-arm64-debug.apk dist/SHA256SUMS \
+            gh release upload "${tag}" dist/app-arm64-debug.apk dist/app-arm64-e2e.apk dist/SHA256SUMS dist/build-metadata.json dist/build-metadata-e2e.json \
               --repo "${GITHUB_REPOSITORY}" --clobber
           else
-            gh release create "${tag}" dist/app-arm64-debug.apk dist/SHA256SUMS \
+            gh release create "${tag}" dist/app-arm64-debug.apk dist/app-arm64-e2e.apk dist/SHA256SUMS dist/build-metadata.json dist/build-metadata-e2e.json \
               --repo "${GITHUB_REPOSITORY}" \
               --title "${title}" \
               --notes "${notes}" \
@@ -136,5 +265,8 @@ jobs:
           gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" \
             --json assets --jq '.assets[].name' > release-assets.txt
           grep -qx 'app-arm64-debug.apk' release-assets.txt
+          grep -qx 'app-arm64-e2e.apk' release-assets.txt
           grep -qx 'SHA256SUMS' release-assets.txt
+          grep -qx 'build-metadata.json' release-assets.txt
+          grep -qx 'build-metadata-e2e.json' release-assets.txt
           echo "GitHub Release: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${tag}"

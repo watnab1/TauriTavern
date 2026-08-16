@@ -31,6 +31,8 @@ class RustWebViewClient(
 
   interface MainFrameNavigationListener {
     fun onMainFramePageStarted(view: WebView, url: String)
+
+    fun onMainFramePageFinished(view: WebView, url: String)
   }
 
   private val assetLoader =
@@ -94,6 +96,7 @@ class RustWebViewClient(
   }
 
   override fun onPageFinished(view: WebView, url: String) {
+    mainFrameNavigationListener?.onMainFramePageFinished(view, url)
     Rust.onPageLoaded((view as RustWebView).id, url)
   }
 
