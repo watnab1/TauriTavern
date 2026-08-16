@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: android-debug-apk-${{ github.ref }}
@@ -83,14 +83,17 @@ jobs:
           apk_root="src-tauri/crates/tauritavern/gen/android/app/build/outputs/apk"
           mkdir -p dist
           mapfile -t apks < <(find "${apk_root}" -type f -name '*debug*.apk' | sort)
-          if [[ "${#apks[@]}" -eq 0 ]]; then
-            echo "No debug APK found under ${apk_root}" >&2
+          if [[ "${#apks[@]}" -ne 1 ]]; then
+            echo "Expected exactly one aarch64 debug APK, found ${#apks[@]} under ${apk_root}" >&2
             exit 1
           fi
-          for apk in "${apks[@]}"; do
-            echo "APK: ${apk}"
-            cp "${apk}" dist/
-          done
+          apk="${apks[0]}"
+          if [[ "$(basename "${apk}")" != "app-arm64-debug.apk" ]]; then
+            echo "Expected app-arm64-debug.apk, found ${apk}" >&2
+            exit 1
+          fi
+          echo "APK: ${apk}"
+          cp "${apk}" dist/
           (cd dist && sha256sum -- ./*.apk > SHA256SUMS)
           cat dist/SHA256SUMS
 
@@ -101,3 +104,37 @@ jobs:
           path: dist/*
           if-no-files-found: error
           retention-days: 7
+
+      - name: Publish aarch64 Debug APK GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="android-debug-aarch64-${GITHUB_SHA:0:7}"
+          title="TauriTavern Android Debug APK (aarch64) ${GITHUB_SHA:0:7}"
+          notes=$(cat <<EOF
+          Automated aarch64 Debug APK build.
+
+          - Commit: \`${GITHUB_SHA}\`
+          - Package: \`com.tauritavern.client.debug\`
+          - ABI: \`arm64-v8a\`
+          - Signing: standard Android Debug key
+          EOF
+          )
+          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${tag} already exists; refreshing aarch64 assets"
+            gh release upload "${tag}" dist/app-arm64-debug.apk dist/SHA256SUMS \
+              --repo "${GITHUB_REPOSITORY}" --clobber
+          else
+            gh release create "${tag}" dist/app-arm64-debug.apk dist/SHA256SUMS \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${title}" \
+              --notes "${notes}" \
+              --prerelease
+          fi
+          gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" \
+            --json assets --jq '.assets[].name' > release-assets.txt
+          grep -qx 'app-arm64-debug.apk' release-assets.txt
+          grep -qx 'SHA256SUMS' release-assets.txt
+          echo "GitHub Release: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${tag}"
