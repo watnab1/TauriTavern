@@ -1,0 +1,4 @@
+# `gemm-common` emits half-precision SIMD inline assembly without enabling the
+# `fp16` target feature, which fails on clean aarch64 Android builds.
+[target.aarch64-linux-android]
+rustflags = ["-C", "target-feature=+fp16"]

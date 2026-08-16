@@ -100,7 +100,8 @@
       "developmentTeam": "Y82Q3U47CB"
     },
     "android": {
-      "minSdkVersion": 26
+      "minSdkVersion": 26,
+      "debugApplicationIdSuffix": ".debug"
     }
   }
 }

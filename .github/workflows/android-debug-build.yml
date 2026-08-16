@@ -1,0 +1,103 @@
+name: Android Debug APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-debug-apk-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  android-debug-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Android host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Setup JDK
+        uses: actions/setup-java@v5
+        with:
+          java-version: "21"
+          distribution: temurin
+          cache: gradle
+          cache-dependency-path: |
+            src-tauri/crates/tauritavern/gen/android/**/*.gradle*
+            src-tauri/crates/tauritavern/gen/android/**/gradle-wrapper.properties
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r29
+          link-to-sdk: true
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # armv7 is not built because ort-sys (fastembed's ONNX Runtime backend)
+      # ships no prebuilt binaries for armv7-linux-androideabi.
+      - name: Build Android Debug APK (aarch64)
+        shell: bash
+        env:
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: >-
+          pnpm android:build --debug --verbose --apk --split-per-abi
+          --target aarch64
+
+      - name: Collect Android Debug APK and checksums
+        id: collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk_root="src-tauri/crates/tauritavern/gen/android/app/build/outputs/apk"
+          mkdir -p dist
+          mapfile -t apks < <(find "${apk_root}" -type f -name '*debug*.apk' | sort)
+          if [[ "${#apks[@]}" -eq 0 ]]; then
+            echo "No debug APK found under ${apk_root}" >&2
+            exit 1
+          fi
+          for apk in "${apks[@]}"; do
+            echo "APK: ${apk}"
+            cp "${apk}" dist/
+          done
+          (cd dist && sha256sum -- ./*.apk > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Upload Android Debug APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauritavern-android-debug-apks
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
